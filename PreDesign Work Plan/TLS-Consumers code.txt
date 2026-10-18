@@ -1,0 +1,706 @@
+
+#include "../include/TlsListener.hpp"
+#include "../../../statistics/common/include/Key.hpp"
+#include "../../../common/include/ViolationAPI.hpp"
+#include <application/shared-data/DPSharedDoublePolicyArray.hpp>
+
+namespace TLSEnforcement {
+    namespace PacketFlow {
+        namespace Engine {
+            /// --------------------------
+            /// Getters & Setters
+            /// --------------------------
+            void TlsListener::setDetector(std::shared_ptr<Detector> detector)
+            {
+                m_detector = detector;
+            }
+            void TlsListener::setReportingManager(std::shared_ptr<ReportingManager> reportingManager)
+            {
+                m_reportingManager = reportingManager;
+            }
+            void TlsListener::setStatisticsRecorder(std::shared_ptr<StatisticsRecorder> statisticsRecorder)
+            {
+                m_statisticsRecorder = statisticsRecorder;
+            }
+            void TlsListener::setFeatureStatusManager(std::shared_ptr<FeatureStatusManager> manager)
+            {
+                m_pFeatureStatusManager = std::move(manager);
+            }
+            void TlsListener::setHttpsPortsViewer(std::shared_ptr<HttpsPortsViewer> httpsPortsViewer)
+            {
+                m_httpsPortsViewer = std::move(httpsPortsViewer);
+            }
+
+            /// --------------------------
+            /// ITlsListener overrides
+            /// --------------------------
+
+            TlsListener::EventMask TlsListener::getSessionEventMask(Session& session) noexcept
+            {
+                if (m_pFeatureStatusManager == nullptr || !m_pFeatureStatusManager->getFeatureStatus()) {
+                    return 0;
+                }
+
+                if (m_httpsPortsViewer == nullptr ||
+                    !m_httpsPortsViewer->isHttpsPort(session.getKey()->getDstPort())) {
+                    return 0;
+                }
+
+                DPPolicyItem* policy = DPSharedDoublePolicyArray::getGlobalSharedPolicyArray()->getActivePolicy(session.getPolicyId());
+                if (policy == nullptr || !policy->profileExists[IDS_PROFILE_TLS_ENFORCEMENT]) {
+                    return 0;
+                }
+
+                return 0b00111111; // all 6 events (ClientHello, Anomaly, TCPReset, SessionEnd, TLSRecord, TerminalPayload)
+            }
+
+            TlsListener::TLSFeatureVerdict TlsListener::onClientHello(Session& session, DPFrame& packet, const ClientHelloData& data, const TLSData& tlsData) noexcept
+            {
+                if (m_detector != nullptr) {
+                    Violation violation = m_detector->onParsedClientHello(session, packet, data, tlsData);
+                    if (ViolationAPI::hasAny(violation)) {
+                        record(packet, violation);
+                        const TLSFlow::TLSViolationMask verdictMask =
+                            ViolationAPI::toTLSViolationMask(violation);
+                        if (m_detector->getPacketAction() == Action::BlockAndReport) {
+                            return TLSFeatureVerdict{TLSFeatureVerdict::Dispatch::Stop, verdictMask};
+                        }
+                        return TLSFeatureVerdict{TLSFeatureVerdict::Dispatch::Continue, verdictMask};
+                    }
+                }
+                return TLSFeatureVerdict{};
+            }
+
+            TlsListener::TLSFeatureVerdict TlsListener::onParsingError(Session& session, DPFrame& packet, ParsingError parsingError, const TLSData& tlsData) noexcept
+            {
+                if (m_detector != nullptr) {
+                    Violation violation = m_detector->onParsingError(session, packet, parsingError, tlsData);
+                    if (ViolationAPI::hasAny(violation)) {
+                        record(packet, violation);
+                        const TLSFlow::TLSViolationMask verdictMask =
+                            ViolationAPI::toTLSViolationMask(violation);
+                        if (m_detector->getPacketAction() == Action::BlockAndReport) {
+                            return TLSFeatureVerdict{TLSFeatureVerdict::Dispatch::Stop, verdictMask};
+                        }
+                        return TLSFeatureVerdict{TLSFeatureVerdict::Dispatch::Continue, verdictMask};
+                    }
+                }
+                return TLSFeatureVerdict{};
+            }
+
+            TlsListener::TLSFeatureVerdict TlsListener::onTCPReset(Session& session, DPFrame& packet, const TLSData& tlsData) noexcept
+            {
+                if (m_detector != nullptr) {
+                    m_detector->onTCPReset(session, tlsData);
+                }
+                return TLSFeatureVerdict{};
+            }
+
+            TlsListener::TLSFeatureVerdict TlsListener::onSessionEnd(Session& session, const TLSData& tlsData) noexcept
+            {
+                if (m_detector != nullptr) {
+                    m_detector->onSessionEnd(session, tlsData);
+                }
+                return TLSFeatureVerdict{};
+            }
+            TlsListener::TLSFeatureVerdict TlsListener::onTLSRecord(Session& session, DPFrame& packet, const TLSFlow::PacketFlow::Engine::TLSRecordContext& context, const TLSData& tlsData) noexcept
+            {
+                if (m_detector != nullptr) {
+                    Violation violation = m_detector->onTLSRecord(session, packet, context, tlsData);
+                    if (ViolationAPI::hasAny(violation)) {
+                        record(packet, violation);
+                        const TLSFlow::TLSViolationMask verdictMask =
+                            ViolationAPI::toTLSViolationMask(violation);
+                        if (m_detector->getPacketAction() == Action::BlockAndReport) {
+                            return TLSFeatureVerdict{TLSFeatureVerdict::Dispatch::Stop, verdictMask};
+                        }
+                        return TLSFeatureVerdict{TLSFeatureVerdict::Dispatch::Continue, verdictMask};
+                    }
+                }
+                return TLSFeatureVerdict{};
+            }
+
+            TlsListener::TLSFeatureVerdict TlsListener::onTerminalPayload(Session& session, DPFrame& packet, const TLSData& tlsData) noexcept
+            {
+                if (m_detector != nullptr) {
+                    Violation violation = m_detector->onTerminalPayload(session, packet, tlsData);
+                    if (ViolationAPI::hasAny(violation)) {
+                        record(packet, violation);
+                        const TLSFlow::TLSViolationMask verdictMask =
+                            ViolationAPI::toTLSViolationMask(violation);
+                        if (m_detector->getPacketAction() == Action::BlockAndReport) {
+                            return TLSFeatureVerdict{TLSFeatureVerdict::Dispatch::Stop, verdictMask};
+                        }
+                        return TLSFeatureVerdict{TLSFeatureVerdict::Dispatch::Continue, verdictMask};
+                    }
+                }
+                return TLSFeatureVerdict{};
+            }
+
+            /// --------------------------
+            /// Helpers
+            /// --------------------------
+
+            void TlsListener::record(DPFrame& packet, Violation violation) noexcept
+            {
+                // Priority order matches FailureType enum order (0=Malformed, 1=Version, etc.)
+                // Report only the first (highest priority) violation found
+                int firstSetBit = __builtin_ffs(violation);
+                if (firstSetBit > 0) {
+                    FailureType failureType = static_cast<FailureType>(firstSetBit - 1);
+
+                    // Record statistics first
+                    if (m_statisticsRecorder != nullptr) {
+                        m_statisticsRecorder->recordPacket(TLSEnforcement::Statistics::Common::Key(packet.getPolicyId(), failureType), 1, packet.getFrameTotalLen());
+                    }
+
+                    // Send reporting sample
+                    if (m_reportingManager != nullptr) {
+                        m_reportingManager->handleReport(&packet, failureType, 1);
+                    }
+                }
+            }
+
+        } // Engine
+    } // PacketFlow
+} // TLSEnforcement#include "../include/Manager.hpp"
+#include "ParsingErrorDetector.hpp"
+#include "RuleBasedDetector.hpp"
+#include "HandshakeAgingTimeDetector.hpp"
+#include "SuspensionDetector.hpp"
+#include "WrongOrderDetector.hpp"
+#include "FinishDetector.hpp"
+#include "AlertDetector.hpp"
+#include "../../../configuration/engine/include/HandshakeAgingTimeManager.hpp"
+#include "../../../common/include/ViolationAPI.hpp"
+
+namespace TLSEnforcement {
+    namespace Detection {
+        namespace Engine {
+
+            struct Manager::DetectorsPack {
+                SuspensionDetector suspensionDetector;
+                HandshakeAgingTimeDetector handshakeAgingTimeDetector;
+                WrongOrderDetector wrongOrderDetector;
+                RuleBasedDetector ruleBasedDetector;
+                ParsingErrorDetector parsingErrorDetector;
+                FinishDetector finishDetector;
+                AlertDetector alertDetector;
+
+                DetectorsPack(std::shared_ptr<ISessionParamsViewer> sessionParamsViewer,
+                              std::shared_ptr<Configuration::Engine::FeatureStatusManager> featureStatusManager,
+                              std::shared_ptr<Configuration::Engine::HandshakeAgingTimeManager> handshakeAgingTimeManager,
+                                                    std::shared_ptr<Configuration::Engine::MaxEarlyDataManager> maxEarlyDataManager,
+                                                    std::shared_ptr<NSDiagnostics::Engine::IDiagnosticsCounters> diagnosticsCounters)
+                                        : suspensionDetector{sessionParamsViewer, diagnosticsCounters},
+                                            handshakeAgingTimeDetector{sessionParamsViewer, featureStatusManager, handshakeAgingTimeManager, diagnosticsCounters},
+                                            wrongOrderDetector{sessionParamsViewer, featureStatusManager, maxEarlyDataManager, diagnosticsCounters},
+                                            ruleBasedDetector{sessionParamsViewer, featureStatusManager, diagnosticsCounters},
+                                            parsingErrorDetector{sessionParamsViewer, featureStatusManager, diagnosticsCounters},
+                                            finishDetector{sessionParamsViewer, featureStatusManager, diagnosticsCounters},
+                                            alertDetector{sessionParamsViewer, featureStatusManager, diagnosticsCounters}
+                {
+                };
+
+                ~DetectorsPack() = default;
+                
+            };
+            /// --------------------------
+            /// Constructors & Destructors
+            /// --------------------------
+            Manager::Manager(std::shared_ptr<ISessionParamsViewer> sessionParamsViewer,
+                             std::shared_ptr<Configuration::Engine::FeatureStatusManager> featureStatusManager,
+                             std::shared_ptr<Configuration::Engine::HandshakeAgingTimeManager> handshakeAgingTimeManager,
+                                         std::shared_ptr<Configuration::Engine::MaxEarlyDataManager> maxEarlyDataManager,
+                                         std::shared_ptr<NSDiagnostics::Engine::IDiagnosticsCounters> diagnosticsCounters
+                             )
+                                                        : m_sessionParamsViewer{sessionParamsViewer},
+                                                            m_detectorsPackPimpl{new DetectorsPack{sessionParamsViewer, featureStatusManager, handshakeAgingTimeManager, maxEarlyDataManager, diagnosticsCounters}}
+            {
+            }
+
+            Manager::~Manager()
+            {
+                delete m_detectorsPackPimpl;
+                m_detectorsPackPimpl = nullptr;
+            }
+            
+            /// --------------------------
+            /// Methods
+            /// --------------------------
+            /// --------------------------
+            /// Setters
+            /// --------------------------
+            void Manager::setMitigator(std::unique_ptr<IMitigator> mitigator) noexcept
+            {
+                m_mitigator = std::move(mitigator);
+            }
+            /// --------------------------
+            /// Event Handlers
+            /// --------------------------
+            Violation Manager::handleEvent(Detector& detectionStrategy, Session& session, DPFrame* packet, const TLSData &tlsData) noexcept
+            {
+                Violation violation = detectionStrategy.detect(session, tlsData);
+                if (!ViolationAPI::hasAny(violation) || !m_mitigator) {
+                    return violation;
+                }
+
+                const Violation newViolation = ViolationAPI::filterAlreadySeen(
+                    violation,
+                    tlsData.terminalViolationMask);
+
+                if (ViolationAPI::hasAny(newViolation)) {
+                    if (packet != nullptr) {
+                        m_mitigator->mitigate(session, *packet, newViolation);
+                    } else {
+                        m_mitigator->mitigate(session, newViolation);
+                    }
+                    return violation;
+                }
+
+                if (packet != nullptr &&
+                    m_sessionParamsViewer != nullptr &&
+                    m_sessionParamsViewer->getPacketAction() == Action::BlockAndReport) {
+                    Violation packetActionOnly = NoViolation;
+                    ViolationAPI::set(packetActionOnly, FailureType::MalformedSession);
+                    m_mitigator->mitigate(session, *packet, packetActionOnly);
+                }
+
+                return violation;
+            }
+
+            Violation Manager::onParsedClientHello(Session &session, DPFrame &packet, const ClientHelloData &clientHelloData, const TLSData &tlsData) noexcept
+            {
+                m_detectorsPackPimpl->ruleBasedDetector.setCurrentClientHelloData(&clientHelloData);
+                Detector& detector = m_detectorsPackPimpl->ruleBasedDetector;
+                return handleEvent(detector, session, &packet, tlsData);
+            }
+
+            Violation Manager::onParsingError(Session &session, DPFrame &packet, ParsingError parsingError, const TLSData &tlsData) noexcept
+            {
+                ParsingErrorDetector& detector = m_detectorsPackPimpl->parsingErrorDetector;
+                detector.observeParsingError(parsingError);
+                detector.setParsingError(parsingError);
+                Violation violation = handleEvent(detector, session, &packet, tlsData);
+                detector.clearParsingError();
+                return violation;
+            }
+
+            Violation Manager::onTLSRecord(Session &session, DPFrame &packet, const TLSFlow::PacketFlow::Engine::TLSRecordContext& context, const TLSData &tlsData) noexcept
+            {
+                if (context.record.isAlert()) {
+                    if (!context.record.readableAlert || !context.alertTerminating) {
+                        return NoViolation;
+                    }
+
+                    Detector& detector = m_detectorsPackPimpl->alertDetector;
+                    (void)handleEvent(detector, session, nullptr, tlsData);
+                    return NoViolation;
+                }
+
+                WrongOrderDetector& detector = m_detectorsPackPimpl->wrongOrderDetector;
+                detector.setLastRecordSeen(&context.record);
+                detector.setCurrentClientHelloSupportedVersionsMask(context.currentClientHelloSupportedVersionsMask);
+                detector.setEarlyDataOffered(context.earlyDataOffered);
+                return handleEvent(detector, session, &packet, tlsData);
+            }
+
+            Violation Manager::onTerminalPayload(Session &session, DPFrame &packet, const TLSData &tlsData) noexcept
+            {
+                Detector& detector = m_detectorsPackPimpl->suspensionDetector;
+                return handleEvent(detector, session, &packet, tlsData);
+            }
+
+            Violation Manager::onTCPReset(Session &session, const TLSData &tlsData) noexcept
+            {
+                Detector& detector = m_detectorsPackPimpl->handshakeAgingTimeDetector;
+                return handleEvent(detector, session, nullptr, tlsData);
+            }
+
+            Violation Manager::onSessionEnd(Session &session, const TLSData &tlsData) noexcept
+            {
+                Detector& detector = m_detectorsPackPimpl->finishDetector;
+                
+                return handleEvent(detector, session, nullptr, tlsData);
+            }
+
+            Action Manager::getPacketAction() const noexcept
+            {
+                return m_sessionParamsViewer->getPacketAction();
+            }
+
+            void Manager::clear() noexcept
+            {
+                // TLS state cleanup is owned internally by the session parameter viewer now.
+            }
+            
+        } // Engine
+    } // Detection
+} // TLSEnforcement
+//
+// Created by talc on 7/28/25.
+//
+
+#include "TlsFlowListener.hpp"
+
+using namespace TLSFingerprint::Engine;
+using TLSFeatureVerdict = TLSFlow::PacketFlow::Engine::TLSFeatureVerdict;
+
+TlsFlowListener::EventMask TlsFlowListener::getSessionEventMask(Session& session) noexcept
+{
+    DPPolicyItem* policy = DPSharedDoublePolicyArray::getGlobalSharedPolicyArray()->getActivePolicy(session.getPolicyId());
+    if (policy != nullptr && policy->profileExists[IDS_PROFILE_TLS_FINGERPRINT]) {
+        return 0b00000001; // ClientHello bit (Event::ClientHello == 0)
+    }
+    return 0;
+}
+
+TLSFeatureVerdict TlsFlowListener::onClientHello(Session& session, DPFrame& packet, const TLSFlow::PacketFlow::Engine::ClientHelloData& data, const TLSData& /*tlsData*/) noexcept
+{
+    packetFlowManager->onParsedClientHello(session, packet, data.getFingerprint());
+    return TLSFeatureVerdict{};
+}
+
+TLSFeatureVerdict TlsFlowListener::onParsingError(Session& /*session*/, DPFrame& /*packet*/, TLSFlow::NSProcessor::Engine::ParsingError /*parsingError*/, const TLSData& /*tlsData*/) noexcept
+{
+    return TLSFeatureVerdict{};
+}
+
+void TlsFlowListener::setSessionObserver(shared_ptr<PacketFlowManager> packetFlowManager) {
+    TlsFlowListener::packetFlowManager = packetFlowManager;
+}
+//
+// Created by sherik on 6/6/22.
+//
+#include "../include/PacketFlowManager.hpp"
+#include <application/shared-data/DPSharedDoublePolicyArray.hpp>
+#include <DPEE/DPEEngine.hpp>
+#include <DPEE/SSLInspection/SSLInspection.hpp>
+
+#include <application/tls-flow/context/engine/include/Application.hpp>
+
+extern "C" {
+#include "../../../GENERIC/diag/diag_log_inject.h"
+}
+using namespace TLSFingerprint;
+using namespace TLSFingerprint::Engine;
+
+
+TLSFlow::PacketFlow::Engine::Action PacketFlowManager::onParsedClientHello(Session &session, DPFrame &packet, const TLSFlow::Fingerprint &fingerprint)
+{
+    /* Fetch policy */
+    DPPolicyItem *policy = DPSharedDoublePolicyArray::getGlobalSharedPolicyArray()->getActivePolicy(packet.getPolicyId());
+    if(policy == nullptr || !policy->profileExists[IDS_PROFILE_TLS_FINGERPRINT])
+        return TLSFlow::PacketFlow::Engine::Action::Continue;
+
+    /* Fetch profile */
+    SharedProfile profile;
+    if(m_pConfigurationManager->getProfile(packet.getPolicyId(), profile) != NSConfigurationManager::Status::Ok)
+        return TLSFlow::PacketFlow::Engine::Action::Continue;
+
+    /* Build server key */
+    NSServerManager::Engine::ServerKey serverKey(policy->hashKey, packet.getPayloadDstIpAddr(), packet.getPayloadDstPort());
+
+    if (m_pServerManager->shouldBeInspected(serverKey) == false)
+        return TLSFlow::PacketFlow::Engine::Action::Continue;
+
+    /* Build key */
+    MasterKey key(policy->hashKey, profile.getHash(), fingerprint);
+    NSStatisticsManager::Common::PolicyServer server(policy->hashKey, packet.getPayloadDstIpAddr(), packet.getPayloadDstPort());
+
+    /* Find filter */
+    ClassificationResult result;
+    ClassificationStatus status = m_pFilters->classify(key, result);
+
+    /* Should we save full string */
+    bool saveFullstring = true;
+
+    /* Update statistics */
+    uint64_t count = 0;
+    Action effectiveAction;
+    if(status == ClassificationStatus::Classified)
+    {
+        if(result.getType() == FilterType::Manual)
+        {
+            saveFullstring = false;
+            m_pStatistics->increment({ packet.getPolicyId(), key, NSStatisticsManager::Common::PolicyServer(), 1 /* Hit */, 1 /* Manual Filter Hit */, 0 /* Behavioral Filter Hit */, 0 /* Reputation Filter Hit */, 0 /* Randomized Filter Hit */, 0 /* On-Demand Filter Hit */});
+            count = m_pStatistics->increment( { NSStatisticsManager::Engine::AttackType::Manual, packet.getPolicyId(), key, 1, packet.getFrameLenWithoutInternalTags() }).second;
+        }
+        else if(result.getType() == FilterType::Behavioral)
+        {
+            m_pStatistics->increment({ packet.getPolicyId(), key, server, 1 /* Hit */, 0 /* Manual Filter Hit */, 1 /* Behavioral Filter Hit */, 0 /* Reputation Filter Hit */, 0 /* Randomized Filter Hit */, 0 /* On-Demand Filter Hit */ });
+            count = m_pStatistics->increment({ NSStatisticsManager::Engine::AttackType::Behavioral, packet.getPolicyId(), key, 1, packet.getFrameLenWithoutInternalTags() }).second;
+        }
+        else if(result.getType() == FilterType::Reputation)
+        {
+            saveFullstring = false;
+            m_pStatistics->increment({ packet.getPolicyId(), key, NSStatisticsManager::Common::PolicyServer(), 1 /* Hit */, 0 /* Manual Filter Hit */, 0 /* Behavioral Filter Hit */, 1 /* Reputation Filter Hit */, 0 /* Randomized Filter Hit */, 0 /* On-Demand Filter Hit */});
+            count = m_pStatistics->increment({ NSStatisticsManager::Engine::AttackType::Reputation, packet.getPolicyId(), key, 1, packet.getFrameLenWithoutInternalTags() }).second;
+        }
+        else if(result.getType() == FilterType::Randomized)
+        {
+            if(result.getAction() == Action::Allow) {
+                m_pStatistics->increment({ packet.getPolicyId(), key, server, 1 /* Hit */, 0 /* Manual Filter Hit */, 0 /* Behavioral Filter Hit */, 0 /* Reputation Filter Hit */, 1 /* Randomized Filter Hit */, 0 /* On-Demand Filter Hit */});
+            }
+            else {
+                m_pStatistics->increment({ packet.getPolicyId(), key, server, 1 /* Hit */, 0 /* Manual Filter Hit */, 0 /* Behavioral Filter Hit */, 0 /* Reputation Filter Hit */, 0 /* Randomized Filter Hit */, 0 /* On-Demand Filter Hit */});
+                count = m_pStatistics->increment({ NSStatisticsManager::Engine::AttackType::Randomized, packet.getPolicyId(), key, 1, packet.getFrameLenWithoutInternalTags() }).second;
+            }
+        }
+        else if(result.getType() == FilterType::OnDemand)
+        {
+            m_pStatistics->increment({ packet.getPolicyId(), key, server, 1 /* Hit */, 0 /* Manual Filter Hit */, 0 /* Behavioral Filter Hit */, 0 /* Reputation Filter Hit */, 0 /* Randomized Filter Hit */, 1 /* On-Demand Filter Hit */});
+            count = m_pStatistics->increment({ NSStatisticsManager::Engine::AttackType::OnDemand, packet.getPolicyId(), key, 1, packet.getFrameLenWithoutInternalTags() }).second;
+        }
+
+        /* Set effective action for filter */
+        if(result.getAction() == Action::AsProfile)
+            effectiveAction = profile.getAction();
+        else
+            effectiveAction = result.getAction();
+    }
+    else
+        m_pStatistics->increment({ packet.getPolicyId(), key, server, 1 /* Hit */, 0 /* Manual Filter Hit */, 0 /* Behavioral Filter Hit */, 0 /* Reputation Filter Hit */, 0 /* Randomized Filter Hit */, 0 /* On-Demand Filter Hit */});
+
+    if(saveFullstring)
+    {
+        /* add to full string table */
+        if(! m_pFullStringProcessor->isExist(fingerprint))
+        {
+            const auto& fs = TLSFlow::Context::Engine::Application::getInstance().getClientHelloDataViewer()->getFullString();
+            if(fs.getLength() > 0)
+            {
+                if(m_pFullStringProcessor->insert(fingerprint, fs.getData(), fs.getLength()) != IFullStringProcessor::ProcessResult::Success)
+                {
+                    ostringstream fpstr;
+                    fpstr << fingerprint;
+                    char *fpch = (char *)fpstr.str().c_str();
+                    //log error here
+                    DIAG_LOGGER_INJECT(TLSFP_FINGERPRINT_FULLSTRING_INSERT_ERROR, fpch);
+                }
+            }
+        }
+    }
+
+    /* Report */
+    if(status == ClassificationStatus::Classified && effectiveAction != Action::Allow) {
+        AttackType attackType;
+        if(result.getType() == FilterType::Manual)
+            attackType = AttackType::Manual;
+        else if(result.getType() == FilterType::Behavioral)
+            attackType = AttackType::Behavioral;
+        else if(result.getType() == FilterType::Reputation)
+            attackType = AttackType::Reputation;
+        else if(result.getType() == FilterType::OnDemand)
+            attackType = AttackType::OnDemand;
+        else
+            attackType = AttackType::Randomized;
+
+        m_pReportingHandler->handleReport(attackType, &packet, key, count);
+    }
+
+    /* Mitigate */
+    if  (status == ClassificationStatus::Classified && (policy->action == IDS_policyAction_blockNreport_E && effectiveAction == Action::BlockAndReport))
+    {
+        RTPCprotection rtpcModule;
+        if(result.getType() == FilterType::Manual)
+            rtpcModule = RTPC_TLS_FINGERPRINT_FILTERS;
+        else if(result.getType() == FilterType::Behavioral)
+            rtpcModule = RTPC_TLS_FINGERPRINT_BEHAVIORAL;
+        else if(result.getType() == FilterType::Reputation)
+            rtpcModule = RTPC_TLS_FINGERPRINT_REPUTATION;
+        else if(result.getType() == FilterType::OnDemand)
+            rtpcModule = RTPC_TLS_FINGERPRINT_ONDEMAND;
+        else
+            rtpcModule = RTPC_TLS_FINGERPRINT_RANDOMIZED;
+
+        if (session.isAxSession())
+        {
+            packet.packetActionSet(PACKET_ACTION_REVERSE_RST_BACK, rtpcModule);
+            session.setIsFeResetSent(true);
+            session.setAgingTimeout(1);
+        }
+        else
+        {
+            // Send rst both to client and to server only is session was already established with server
+            if (session.getState() == session_state_established)
+                packet.packetActionSet(PACKET_ACTION_RESET_BIDIRECTIONAL, rtpcModule);
+            else
+                packet.packetActionSet(PACKET_ACTION_REVERSE_RST_BACK, rtpcModule);
+
+            session.setAgingTimeout(1);
+
+        }
+
+        return TLSFlow::PacketFlow::Engine::Action::Stop;
+    }
+
+    return TLSFlow::PacketFlow::Engine::Action::Continue;
+}
+
+TLSFlow::PacketFlow::Engine::Action PacketFlowManager::handleApplicationData(Session& session, DPFrame& packet)
+{
+    return TLSFlow::PacketFlow::Engine::Action::Continue;
+}
+
+//
+// Created by avist on 8/14/25.
+//
+
+#include "TlsFlowListener.hpp"
+#include <application/shared-data/DPSharedDoublePolicyArray.hpp>
+
+namespace TLSVisibility {
+    namespace NSMonitor {
+        namespace Engine {
+            /// --------------------------
+            /// Getters & Setters
+            /// --------------------------
+            void TlsFlowListener::setCollector(std::shared_ptr<ICollector> collector) {
+                m_pCollector = collector;
+            }
+
+            void TlsFlowListener::setFeatureStatusManager(std::shared_ptr<FeatureStatusManager> manager)
+            {
+                m_pFeatureStatusManager = std::move(manager);
+            }
+
+            bool TlsFlowListener::isEnabled(Session& session) const noexcept
+            {
+                if (m_pFeatureStatusManager == nullptr || !m_pFeatureStatusManager->getFeatureStatus()) {
+                    return false;
+                }
+
+                DPPolicyItem* policy = DPSharedDoublePolicyArray::getGlobalSharedPolicyArray()->getActivePolicy(session.getPolicyId());
+                return policy != nullptr && policy->tlsVisibilityStatus == IDSP_enable_E;
+            }
+
+            /// --------------------------
+            /// ITlsListener overrides
+            /// --------------------------
+
+            TlsFlowListener::EventMask TlsFlowListener::getSessionEventMask(Session& session) noexcept
+            {
+                if (isEnabled(session)) {
+                    return 0b00000001; // ClientHello bit (Event::ClientHello == 0)
+                }
+
+                return 0;
+            }
+
+            TLSFlow::PacketFlow::Engine::TLSFeatureVerdict TlsFlowListener::onClientHello(Session& session, DPFrame& packet, const TLSFlow::PacketFlow::Engine::ClientHelloData& data, const TLSData& /*tlsData*/) noexcept
+            {
+                if (m_pCollector && isEnabled(session)) {
+                    m_pCollector->collect(getParams(packet, data));
+                }
+                return TLSFlow::PacketFlow::Engine::TLSFeatureVerdict{};
+            }
+
+            /// --------------------------
+            /// Helpers
+            /// --------------------------
+            Params TlsFlowListener::getParams(DPFrame& packet, const TLSFlow::PacketFlow::Engine::ClientHelloData& data) const noexcept
+            {
+                return {packet.getPolicyId(),
+                        data.getFingerprint(),
+                        data.getSni(),
+                        data.getTlsVersion(),
+                        packet.getPayloadDstIpAddr(),
+                        packet.getPayloadDstPort()};
+            }
+
+        } // Engine
+    } // NSMonitor
+} // TLSVisibility//
+// Created by maxg on 7/23/25.
+//
+
+#include "TlsMonitor.hpp"
+#include "../../../../../misc/fqdn/Manager.hpp"
+
+using namespace TLSVisibility::NSMonitor::Engine;
+
+/// ----------------------------------------------------------------------------------
+///     Interface implementations - ICollector
+/// ----------------------------------------------------------------------------------
+void TLSMonitor::collect(const Params& params) noexcept
+{
+    /*
+     * Step 1: Determine SNI type from configuration (full or base). If base, extract base SNI from params.
+     * Step 2: Log the parameters.
+     *  Step 2.1: Log Server (policy ID, IP, port) -> get server ID.
+     *  Step 2.2: Log SNI (policy ID, Base-SNI/Full-SNI) -> get SNI ID
+     * Step 3: Record the parameters.
+     */
+
+    // Step 1:
+    // Determine SNI type from configuration
+    SniType sniType;
+    auto policyId = params.getPolicyId();
+    if(policyId == NSCommon::InvalidPolicyId)
+    {
+        // Invalid policy ID, abort
+        return;
+    }
+    m_pConfiguration->getSettings(policyId, [&sniType](NSCommon::PolicyId, const NSConfiguration::Settings& settings) {
+        sniType = settings.getSniType();
+    });
+
+
+    //Step 2: Log the parameters.
+    //Log Server:
+    auto serverId = m_pServerRegistry->log({policyId, params.getIP(), params.getPort()});
+    if(serverId == NSCommon::InvalidServerId)
+    {
+        // Failed to log server, abort
+        return;
+    }
+    // Log SNI:
+    // If SNI type is Base, extract base SNI from params
+    NSCommon::SniId sniId{NSCommon::InvalidSniId};
+    if(sniType == SniType::Base)
+    {
+        sniId = m_pServerRegistry->log({policyId, params.getSni().getLen() == 0 ? TLSFlow::Sni{"NoSniExtension"} : TLSFlow::Sni{FQDN::Manager::getInstance().getBaseDomain(params.getSni().c_str())}});
+    }
+    else
+    {
+        sniId = m_pServerRegistry->log({policyId, params.getSni().getLen() == 0 ? TLSFlow::Sni{"NoSniExtension"} : params.getSni()});
+    }
+
+    if(sniId == NSCommon::InvalidSniId)
+    {
+        // Failed to log SNI, abort
+        return;
+    }
+
+    //Step 3: Record the parameters. build params with constructor Params(NSCommon::PolicyId policyId, NSCommon::ServerId serverId, NSCommon::SniId sniId, const TLSFlow::Fingerprint& fingerprint, Misc::TLSVersion version)
+    m_pRecorder->record({policyId, serverId, sniId, params.getFingerprint(), params.getTlsVersion()});
+}
+
+/// --------------------------
+/// Getters & Setters
+/// --------------------------
+void TLSMonitor::setConfiguration(std::shared_ptr<Configuration> pConfiguration)
+{
+    m_pConfiguration = pConfiguration;
+}
+
+void TLSMonitor::setServerRegistry(std::shared_ptr<ServerRegistry> pServerRegistry)
+{
+    m_pServerRegistry = pServerRegistry;
+}
+
+void TLSMonitor::setRecorder(std::shared_ptr<Recorder> pRecorder)
+{
+    m_pRecorder  = pRecorder;
+}
+
+/// --------------------------
+/// Helpers
+/// --------------------------
+
+/// ----------------------------------------------------------------------------------
+///     Concrete implementations
+/// ----------------------------------------------------------------------------------
+TLSMonitor::TLSMonitor() {}
+TLSMonitor::~TLSMonitor() {}
