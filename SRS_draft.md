@@ -1,4 +1,4 @@
-# SRS Template
+# Web DDoS TLS Fingerprinting over QUIC SRS
 
 ## Document Metadata
 
